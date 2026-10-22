@@ -8,10 +8,11 @@ Companion documents: [AZE0_4NC0A_diagnostic_services.md](../AZE0_24(4NC0A)/AZE0_
 firmware), [ZE0_3NA0D_diagnostic_services.md](../ZE0(3NA0D)/ZE0_3NA0D_diagnostic_services.md) (ZE0 firmware) and the
 cyclic frames ([ZE1_5SH2D_cyclic_CAN_frames.md](ZE1_5SH2D_cyclic_CAN_frames.md)).
 
-**Scope of this version:** only service **0x21** (ReadDataByLocalIdentifier) has been analysed on this firmware so
-far. Sessions, service 0x19 (DTCs and freeze frames), 0x14, 0x30, 0x31, 0x3B and 0x3E are not covered yet; where a 21
-record is written by a 3B service, that is mentioned. Service 0x27 (SecurityAccess) and reprogramming are not covered
-on purpose.
+**Not covered on purpose:** service 0x27 (SecurityAccess) and anything to do with reprogramming. Service 0x27 exists and
+some write / routine / actuator services require it; those rows just say "security access". On this firmware the
+3B writes and 31 FA were only read up to their entry checks (session, security access, request length); what they do
+afterwards was not analysed. Service 0x30 was analysed in full. Seed/key handling, the
+programming session and the boot loader are not documented here.
 
 Conventions:
 - All multi-byte values are **big-endian** in the responses.
@@ -22,17 +23,210 @@ Conventions:
 
 ---
 
-## 1. Transport
+## 1. Transport and sessions
 
 | item | value |
 |---|---|
-| Response CAN ID | **0x7BB** (11-bit) |
-| Protocol | KWP2000-style services on ISO-TP (ISO 15765-2) |
-| Multi-frame responses | up to 690 bytes |
+| Request CAN ID | **0x79B** (11-bit). No functional / broadcast address is accepted |
+| Response CAN ID | **0x7BB**, always DLC 8, padded with 0xFF |
+| Protocol | KWP2000-style services on ISO-TP (ISO 15765-2). Services 0x19 and 0x22 use the UDS layout |
+| Request frames | must be DLC 8; single frame length 1..7; multi-frame requests 8..630 bytes (longer → flow control `32`, overflow) |
+| Flow control sent by the LBC | `30 01 00` after the first frame and after every consecutive frame (BS = 1, STmin = 0) |
+| Multi-frame responses | up to 690 bytes; BS and STmin of the tester's **first** flow control are used for the whole response (STmin ≥ 0x80 is treated as 127 ms); at most one CF per 10 ms |
+| Transport timeouts | 1 s waiting for a flow control or consecutive frame; on expiry the transfer is dropped without a negative response |
+| Response time (P2) | about **900 ms** (20 × 45 ms at a 22 MHz clock, clock inferred). After that `7F <sid> 23` is sent first, then `7F <sid> 21`; the tester must repeat the identical request to get the held response. A different request while the busy answer is outstanding gets `7F <sid> 21` and is discarded; a different request once the response is held replaces it (the held response is lost) |
+| Session timeout (S3) | **5.0 s** after the last response (positive or negative). Then the session returns to 0x81, the access level is lost and running 0x30 tests stop |
+
+### Sessions (service 0x10)
+
+| request | response | session | conditions |
+|---|---|---|---|
+| `10 81` | `50 81` | default | none |
+| `10 C0` | `50 C0` | manufacturer session C0 (workshop) | none to enter |
+| `10 F0` | `50 F0` | manufacturer session F0 | vehicle stopped: motor torque 0 or invalid (CAN 0x1DA) and speed 0, else `7F 10 22` and the session falls back to 0x81 (C0 is kept if it was active) |
+| `10 F1` | `50 F1` | manufacturer session F1 | same as F0 |
+| `10 85` | (none from the application) | programming session | not documented here; refused with `7F 10 22` |
+
+- Wrong length (≠ 2) or unknown session → `7F 10 12`. The positive response is always 2 bytes; there is no
+  suppress-positive-response bit.
+- Any session change drops the access level of the session being left and stops its 0x30 tests.
+- F0 / F1 drop back to 0x81 as soon as the motor torque or the vehicle speed become non-zero.
+- In C0, the access level is lost (the session stays C0) when ignition is off, supply < 10 V or speed > 5 km/h.
+
+### Negative response codes
+
+| NRC | meaning | typical cause |
+|---|---|---|
+| 0x11 | serviceNotSupported | unknown service |
+| 0x12 | subFunctionNotSupported / invalidFormat | wrong length, unknown local ID / DID / sub-function, wrong extended session for that ID |
+| 0x21 | busyRepeatRequest | response not ready (second and later), or a different request while busy |
+| 0x22 | conditionsNotCorrect | 10 F0/F1 while moving, 10 85 refused, 14 with no wake input, 30 10 with a low cell |
+| 0x23 | routineNotComplete | first "response not ready" notice |
+| 0x33 | securityAccessDenied | service needs security access |
+| 0x7F | serviceNotSupportedInActiveSession | 30 / 3B in the default session; 34 always |
+
+### Services
+
+| SID | name | notes |
+|---|---|---|
+| 10 | StartDiagnosticSession | §1 |
+| 14 | ClearDiagnosticInformation | §2 |
+| 19 | ReadDTCInformation (UDS layout) | §3 |
+| 21 | ReadDataByLocalIdentifier | §4, no session or security needed |
+| 22 | ReadDataByIdentifier (UDS layout) | §5, DTC event log; new on ZE1 |
+| 27 | SecurityAccess | exists, not documented |
+| 30 | InputOutputControlByLocalIdentifier | §6 |
+| 31 | StartRoutineByLocalIdentifier | §7 |
+| 34 | RequestDownload | always `7F 34 7F` in the application |
+| 3B | WriteDataByLocalIdentifier | §8 |
+| 3E | TesterPresent | §9 |
+| other | | `7F <sid> 11` |
+
+The services 21, 30, 31 and 3B answer the local IDs 00 / 20 / 40 / 60 with a 4-byte "supported IDs" bitmap in the OBD
+style (byte 0 bit 7 = ID+1 ... byte 3 bit 0 = ID+0x20, which also means "next range supported"). Several working IDs
+are **not** advertised in these bitmaps.
 
 ---
 
-## 2. Service 0x21: read data by local identifier
+## 2. Service 0x14: clear DTCs
+
+| request | response | conditions |
+|---|---|---|
+| `14 FF FF FF` | `54` (1 byte) | any session, no security; a wake input (ignition line or the second wake input) must be active, else `7F 14 22` |
+| other group / length | `7F 14 12` | |
+
+The `54` is sent about 10 ms later, after the clear has run. It clears the DTC status words and aging counters, both
+freeze frames, the 21 82 communication-DTC healing counters, the 22 DA00 event log and DA10–DA14 traces, the weak-cell
+result, the cell-monitor / P33F9 fault context words, and resets every diagnostic item and the live fault detectors so
+present faults are detected again. The freeze frames and confirmed DTCs are restored at start-up from a non-volatile
+copy; when the cleared state is written back to it was not traced.
+
+---
+
+## 3. Service 0x19: read DTC information
+
+| request | response |
+|---|---|
+| `19 02 MM` | `59 02 0E` + n × {DTC high, DTC middle, DTC low, status} for every DTC with `status & MM & 0x0E ≠ 0`; at most 171 DTCs |
+| `19 04 D1 D2 D3 FF` | `59 04 D1 D2 D3 SS`, plus `00 A6` and 166 snapshot records (§3.3) if a freeze frame exists for this DTC (total 688 bytes) |
+| `19 06 D1 D2 D3 81` | `59 06 D1 D2 D3 SS`, plus `81 AA` if the DTC is confirmed (AA = aging counter 0..40) |
+| anything else | `7F 19 12` (also for an unknown DTC or record number) |
+
+No session or security check. 19 01, 19 0A and other UDS sub-functions are not implemented. D3 is the failure-type
+byte of the DTC (00 for most codes, see §3.2).
+
+### 3.1 Status byte
+
+Only bits 1, 2, 3 are reported (availability mask **0x0E**):
+
+| bit | meaning |
+|---|---|
+| 1 | test failed now |
+| 2 | pending (set with bit 1; cleared at an ignition cycle in which the test passed) |
+| 3 | confirmed (set when failing and the item's test is complete; cleared when the aging counter reaches 40, i.e. after 40 ignition cycles tested, passed and not failing; U-codes never age out) |
+
+Typical masks: `19 02 08` confirmed, `19 02 04` pending, `19 02 0C` both. When several diagnostic items share one DTC,
+their failed / complete bits are ORed and their passed bits ANDed. A newly confirmed DTC is also broadcast on CAN
+0x18CC07BB (see [ZE1_5SH2D_cyclic_CAN_frames.md](ZE1_5SH2D_cyclic_CAN_frames.md)).
+
+### 3.2 DTC list (175 codes)
+
+Codes are 3 bytes: the 2-byte code and a failure-type byte (FTB, in brackets where not 00).
+
+| codes | count | meaning (where known) |
+|---|---|---|
+| P0A1F | 1 | battery ECU internal (shared by several internal checks; inferred) |
+| P33D6 | 1 | not identified |
+| P33F9 (83), P33F9 (87) | 2 | external monitor IC: bad reply (receive or CRC error) to the CPU self-test echo (see 21 12) |
+| U1000 | 1 | CAN communication |
+| P31A4 P3199 P30E0 P31A7 P319C P30E3 P30E4 P30E2 P318D P318E P3191 P3196 P3198 | 13 | same codes as the AZE0 CAN receive / transmit faults of the individual messages (not re-checked on ZE1) |
+| U1032 U1033 U1034 U216D U214E U215B | 6 | communication codes, not identified |
+| P33A5 … P33AE (83) | 10 | cell-monitor family (see 21 95) |
+| P33AF … P33B7 (46) | 9 | cell-monitor family (see 21 95) |
+| P33C0 … P33C7 (52), P33C8 … P33CF (1C) | 16 | 8-code families, one code per cell-monitor IC (inferred) |
+| P32B6 … P32BD (1C), P32BE … P32C5 (25) | 16 | 8-code families, per cell-monitor IC (inferred) |
+| P32C6 … P32D5 (11) | 16 | two 8-code families, per cell-monitor IC (inferred) |
+| P307B … P3082 | 8 | 8-code family, per cell-monitor IC (inferred) |
+| P32BE … P32C5 (00) | 8 | second set of the P32BE family with FTB 00 (shared DTCs) |
+| P33D5 P33FA P33FB P33D7 P33D9 P33DD P33EB P33DF P33E0 P33E1 | 10 | sensor and analog checks (individual mapping not identified) |
+| P32D6 (13) | 1 | not identified |
+| P0A0D | 1 | HV interlock |
+| P3302 … P3319 | 24 | first bank of a 24-unit check (inferred: one per 4-cell unit) |
+| P3375 … P338C | 24 | second bank of the same check |
+| P33E2 P33D4 P33E6 P33ED P33EA P33EE P30EC P30ED | 8 | P33ED = weak cell (two consecutive 21 09 ratios above 1.8); P33EA = output P400.0 read-back mismatch (21 10); others not identified |
+
+All 7 U-codes (U1000 U1032 U1033 U1034 U214E U215B U216D) never age out. The internal DTC index (position in this
+list, starting at 1) is what snapshot records 14 01 / 14 02 store.
+
+### 3.3 Freeze-frame (snapshot) records of 19 04
+
+The LBC keeps **two** freeze frames: the first confirmed DTC, and the most recent one (each new confirmed DTC
+overwrites the second). When the first is cleared by aging, the second moves up. The data is captured once, in the
+DTC task pass in which the DTC confirms. Each record is sent as `14 xx` + data. Units are those of the matching 21
+field; invalid codes are kept as they were at capture time.
+
+| record | bytes | content | units |
+|---|---|---|---|
+| 14 01 | 2 | internal DTC index of the first freeze frame | |
+| 14 02 | 2 | internal DTC index of the second (latest) freeze frame | |
+| 14 03 | 2 | number of the diagnostic item that set the DTC (first failing one for shared DTCs) | |
+| 14 04 | 4 | current sensor channel 1, zero-corrected, ×1000 | milli-counts, signed |
+| 14 05 | 2 | learned channel 1 zero | ADC counts |
+| 14 06 | 4 | battery current | mA, signed, + = charge |
+| 14 07 | 4 | current sensor channel 2, zero-corrected, ×1000 | milli-counts, signed |
+| 14 08 | 2 | learned channel 2 zero | ADC counts |
+| 14 09 | 4 | channel 1 zero used | ADC counts × 10⁶ |
+| 14 0A | 2 | 2.5 V reference | ADC counts (512 = 2.5 V) |
+| 14 0B | 2 | charge power limit | 10 W |
+| 14 0C | 2 | discharge power limit | 10 W |
+| 14 0D | 2 | pack voltage from the cell sum | 10 mV |
+| 14 0E | 2 | 12 V supply | mV |
+| 14 0F | 2 | isolation (IR) sensor wave voltage | ADC counts (0x3FF invalid) |
+| 14 10 | 4 | pack resistance | mΩ × 1024 |
+| 14 11 | 2 | Hx (resistance health) | 0.01 % |
+| 14 12 | 4 | SOC | ppm (1 000 000 = 100 %) |
+| 14 13 | 4 | full capacity | 0.1 mAh |
+| 14 14 | 1 | HV interlock loop closed | 0 / 1 |
+| 14 15 … 14 1F, 14 21 … 14 3F, 14 41 … 14 5F, 14 61 … 14 77 | 2 each | cell voltages 1..96 (numbers x00 / x20 / x40 / x60 are skipped) | mV |
+| 14 78 | 2 | pack voltage (as on 0x1DB) | 10 mV |
+| 14 79 | 2 | inverter voltage from CAN 0x1DA | 10 mV |
+| 14 7A | 4 | channel 2 zero used | ADC counts × 10⁶ |
+| 14 7B | 2 | current sensor channel 1 | ADC counts |
+| 14 7C | 1 | 5 V supply fault wake count | count 0..40 |
+| 14 7D | 2 | isolation sensor | ADC counts |
+| 14 7E | 1 | isolation sensor fault latched | 0 / 1 |
+| 14 7F / 14 81 | 2 / 1 | temperature sensor 1: ADC / °C | counts / °C signed |
+| 14 82 / 14 83 | 2 / 1 | temperature sensor 2: ADC / °C | |
+| 14 86 / 14 87 | 2 / 1 | temperature sensor 3: ADC / °C | |
+| 14 88 | 1 | vehicle mode | 1 charging, 2 ignition on / not charging, 3 off (labels inferred) |
+| 14 89 | 1 | charge mode from CAN 0x1F2 | 0 none, 1 normal, 2 quick |
+| 14 8A / 14 8B | 1 each | weak-cell ratio of the max / min voltage cell (see 21 09) | ratio × 64 |
+| 14 8C / 14 8D | 1 each | weak cell pair of the max / min voltage cell (see 21 09) | pair 1..48, 0xFF none |
+| 14 8E | 2 | expected usable energy fraction at full (21 0A d0) | Q15 (32768 = 1.0) |
+| 14 8F | 2 | estimated usable energy fraction at full (21 0A d2) | Q15 |
+| 14 90 | 2 | display SOC | Q15 |
+| 14 91 | 1 | output P400.0 command (see 21 10) | 0 / 1 |
+| 14 92 | 1 | debounced digital input (port FFFFF412 bit 4) | 0 / 1 |
+| 14 93 | 2 | current sensor channel 2 | ADC counts |
+| 14 94 | 4 | channel 2 current, 10-sample mean | mA, signed |
+| 14 95 | 4 | channel 1 current, 10-sample mean | mA, signed |
+| 14 B3 | 2 | 5 V supply | ADC counts |
+| 14 B4 | 2 | further ADC channel (21 11 d2) | ADC counts |
+| 14 B5 / 14 B6 | 2 each | ADC low / high test channel (21 11 d4 / d6) | ADC counts |
+| 14 BC | 1 | last external-monitor self-test number (21 12 d0) | |
+| 14 BD | 4 | last external-monitor result word (21 12 d1) | |
+| 14 C1 | 2 | max power for charger | 100 W, signed |
+| 14 D5 | 2 | cell-monitor communication error bits | bit mask |
+| 14 D6 | 1 | cell-monitor IC error bits (bit n = IC n) | bit mask |
+| 14 D7 … 14 DF | 2 each | status registers 0..8, ORed over all cell-monitor ICs (bits not decoded) | bit mask |
+| 14 E1 | 4 | at the last cell-monitor fault: system state × 65536 + 12 V supply in mV | |
+| 14 E2 / 14 E3 | 4 each | at the last cell-monitor fault: internal mode bytes / communication error and IC status bits | |
+| 14 E4 | 4 | at the last P33F9 fault: system state × 65536 + 12 V supply in mV | |
+| 14 E5 | 4 | at the last P33F9 fault: communication diagnosis bits | |
+
+---
+
+## 4. Service 0x21: read data by local identifier
 
 `21 xx` (length exactly 2). No session or security is needed for any local ID. Unknown ID or wrong length → `7F 21 12`.
 
@@ -567,10 +761,173 @@ The 8-item families most likely correspond to the 8 cell-monitor groups (inferre
 
 ---
 
-## 3. Differences from the AZE0 (4NC0A) firmware (service 0x21)
+## 5. Service 0x22: read data by identifier (DTC event log)
+
+New on ZE1. One DID per request (length exactly 3), no session or security check. Other DID or length → `7F 22 12`.
+
+| request | response length | content |
+|---|---|---|
+| `22 DA 00` | 318 | `62 DA 00` + 5 event records × 63 bytes |
+| `22 DA 1n` (n = 0..4) | 261 | `62 DA 1n` + bit-packed trace of record n |
+
+### What is recorded
+
+An **event** is a newly confirmed DTC of the LBC (the one it broadcasts on 0x18CC07BB) or a DTC broadcast received
+from another ECU on a 29-bit ID 0x18CCxxxx. A sampler runs every 100 ms and keeps a ring of the last 37 samples of 18
+channels. When an event arrives, a record is opened; for the next 0.6 s every further event is added to the same
+record (at most 8), each with a **capture phase** (0 at the opening pass, 1 for 0.1–0.2 s, 2 for 0.3–0.4 s, 3 for
+0.5–0.6 s). At the end, 19 ring samples 200 ms apart (about 3.0 s before to 0.6 s after the first event) are copied
+into the record's trace. A later event opens a new record.
+
+Record slots fill 0, 1, 2, 3, 4 and then rotate over 2, 3, 4: **records 0 and 1 keep the first two events since the
+last clear**. Cleared by `14 FF FF FF`.
+
+### 22 DA00: event records
+
+Record r starts at response byte 3 + 63 × r. Records are in slot order, not time order; use the sequence number.
+
+| record byte | size | content |
+|---|---|---|
+| 0 | u8 | sequence number (wraps after 0xFE); 0xFF = empty record |
+| 1 | bits | bit7 always 0; bit6 raw ignition input active at the event; bits 5..3 number of events − 1 (0..7); bits 2..0 = 0. Empty record: 0xF8 |
+| 2–4 | u24 | odometer from CAN 0x5C5 in km (converted from miles when the 0x355 unit flag is set), clamp 999 999; 0xFFFFFF empty |
+| 5 | 4 × 2 bits | capture phase of events 0..3 (event 0 in bits 7..6) |
+| 6 | 4 × 2 bits | capture phase of events 4..7 |
+| 7 + 7k … 10 + 7k | u32 | event k CAN ID (29 bits): 0x18CC07BB = this LBC, else the ID of the sending ECU; 0x1FFFFFFF = empty |
+| 11 + 7k … 13 + 7k | u24 | event k DTC, 3 bytes (same format as service 0x19) |
+
+k = 0..7.
+
+### 22 DA10 … DA14: event traces
+
+`62 DA 1n`, then an MSB-first bit stream starting at byte 3 bit 7. Each channel has 19 elements, element 0 = newest
+(200 ms apart), each element MSB first, continuing across byte boundaries. Byte 260 bits 3..0 are padding (0).
+
+| row | start (byte.bit) | bits × n | content |
+|---|---|---|---|
+| 0 | 3.7 | 8 × 1 | sequence number of record n (as DA00) |
+| 1 | 4.7 | 8 × 19 | CAN 0x625 byte 2 (meaning not identified) |
+| 2 | 23.7 | 10 × 19 | 12 V supply: V = 6.00 + x × 0.01; 0x3E9 invalid, 0x3FD < 6 V, 0x3FE > 16 V |
+| 3 / 4 / 5 | 46.1 / 49.6 / 51.3 | 1 × 19 each | always 0 (1 after a clear) |
+| 6 | 53.0 | 1 × 19 | 0x50B byte 2 bit 2 |
+| 7 | 56.5 | 2 × 19 | always 0 (3 after a clear) |
+| 8 | 61.7 | 2 × 19 | VCM state from 0x50B (0 or 3, as 21 0B d33) |
+| 9 | 65.1 | 2 × 19 | `LB_RefusetoSleep` (1 sleep allowed, 2 refuse) |
+| 10 | 70.3 | 8 × 19 | `LB_Failsafe_Status` |
+| 11 | 89.3 | 8 × 19 | `LB_Relay_Cut_Request` |
+| 12 | 108.3 | 8 × 19 | SOC (`LB_SOC`), %; 0xFE clamp |
+| 13 | 127.3 | 8 × 19 | display SOC, %; 0xFE clamp |
+| 14 | 146.3 | 16 × 19 | battery current, 20 mA, signed (+ = charge) |
+| 15 | 184.3 | 8 × 19 | pack voltage, 2 V; 0xFE clamp |
+| 16 | 203.3 | 8 × 19 | isolation sensor wave voltage × 488 / 2000 (about 20 mV units, inferred); 0xFE clamp |
+| 17 | 222.3 | 8 × 19 | highest cell voltage, 20 mV; 0xFE clamp |
+| 18 | 241.3 | 8 × 19 | lowest cell voltage, 20 mV; 0xFE clamp |
+
+---
+
+## 6. Service 0x30: input/output control
+
+Only in sessions **C0, F0, F1** (else `7F 30 7F`). FA, FB and 10 are gated by an elevated security level (without it
+`7F 30 33`).
+
+| request | session | response | function |
+|---|---|---|---|
+| `30 00/20/40/60` | C0 / F0 / F1 | `70 xx b1 b2 b3 b4` | supported IDs (C0 advertises 10; F0 / F1 advertise nothing) |
+| `30 FA 00 GG MH ML` | F0 + security access | `70 FA 01` | **cell bleed test** for 30 s: cell-monitor group GG (1..8 = cells 12(GG−1)+1 … 12·GG; **00 = all groups**) bleeds the cells in the 12-bit mask MH ML (bit 11 = first cell of the group … bit 0 = 12th), bypassing the normal balancing decision |
+| `30 FA 01` | F0 + security access | `70 FA SS` | bleed test status: 00 never run, 01 running, 02 ended (timeout, session left or aborted), 11 stopped by tester |
+| `30 FA 11` | F0 + security access | `70 FA 11` | stop the bleed test |
+| `30 FB 00 MM` | F0 / F1 + security access | `70 FB 01` | override for 30 s, MM 01 = on, 00 = off (**drives nothing on ZE1**, see below) |
+| `30 FB 01` / `30 FB 11` | F0 / F1 + security access | `70 FB SS` / `70 FB 11` | status (01 running, 02 ended, 11 returned) / return control |
+| `30 10 20 MM` | C0 + security access | `70 10 01` | override without a timer (MM 01 on / 00 off; drives nothing on ZE1); refused with `7F 30 22` while the lowest cell is at or below the low-cell threshold |
+| `30 10 01` / `30 10 11` | C0 + security access | `70 10 SS` / `70 10 11` | status (01 running, 12 stopped by low cell voltage, 02 ended, 11 returned) / return control (`7F 30 22` while the status is 12) |
+
+All tests end when the session that started them is left (also by the S3 timeout or the drive lock-out), or when a
+held response is replaced by a different request. GG ≥ 9, MH ≥ 0x10 or a wrong length → `7F 30 12`.
+
+**Bleed test details.** The tester's mask replaces the normal balancing request of the selected groups. Groups with a
+cell-monitor fault are still not bled. The firmware also ANDs every group's command with a parity mask that switches
+between odd and even cells (0xAAA / 0x555) every so often, so only every second requested cell bleeds at any one time,
+alternating. The per-cell result can be read with 21 06.
+
+**Low-cell threshold (30 10).** OCV at the SOC where about 280 Wh of the full energy remain (from the OCV-by-SOH table),
+plus a fixed offset and 0.21 × the learned cell resistance, clamp 4550 mV. The check is repeated every 10 ms. If the
+lowest cell drops to the threshold, the override is cleared and the status becomes 12. If it then recovers, the status
+becomes 02 and the override stays off.
+
+**FB / 10 on ZE1.** The two overrides keep their AZE0 request format, timers and status codes, but nothing outside
+service 0x30 reads their state. The output they switched on AZE0 (battery heater relay) corresponds to the 21 10
+output, which no code drives in this firmware. They answer normally but switch nothing.
+
+---
+
+## 7. Service 0x31: routines
+
+| request | session | response | function |
+|---|---|---|---|
+| `31 00/20/40/60` | any | `71 xx b1 b2 b3 b4` | supported routines: 02 in sessions 81 / F0 / F1, nothing in C0 (FA is not advertised) |
+| `31 02 00` / `31 02 01` | any | `71 02 01` / `71 02 02` | end post-key-off balancing. Has no effect in this firmware (the flag it clears is never set) |
+| `31 FA 00` / `31 FA 01` | F0 / F1 + security access | `71 FA 01` / `71 FA 01` running, `71 FA 02` done | not analysed (AZE0: write the 3B 84 / 90 data to EEPROM) |
+
+Wrong length or unknown routine → `7F 31 12`. The second byte `01` only returns a status; it does not run the routine.
+The AZE0 routines 31 03 (reset SOH) and 31 04 (clear usage statistics) do not exist on ZE1; the usage history is
+cleared with `3B 70 01` instead.
+
+---
+
+## 8. Service 0x3B: write data by local identifier
+
+Not in the default session (`7F 3B 7F`). Each ID needs its own session; in another extended session → `7F 3B 12`; without
+security access → `7F 3B 33`; wrong length → `7F 3B 12`. Every write ID needs security access, so only these entry
+checks were read on this firmware. The request length of each ID equals the response length of the matching 21 read,
+so the layout is expected to be the 21 layout (inferred, not verified byte by byte).
+
+| request (length) | session | stores |
+|---|---|---|
+| `3B 00/20/40/60` (2) | C0 / F0 / F1 | supported IDs (C0: 61–65, 67, 69, 6B, 6D, 70; F0 / F1: none) |
+| `3B 61` + 329 bytes (331) | C0 | SOH / aging record, as 21 61 |
+| `3B 62` + 118 bytes (120) | C0 | charge counts and histograms, as 21 62 |
+| `3B 63 HH LL` (4) | C0 | spare word |
+| `3B 64 NN` (3) | C0 | 5 V supply fault wake count |
+| `3B 65` + 378 bytes (380) | C0 | lifetime usage history, as 21 65 |
+| `3B 67` + 620 bytes (622) | C0 | age-milestone history, as 21 67 |
+| `3B 69` + 5 bytes (7) | C0 | odometer rollback record, as 21 69 |
+| `3B 6B` + 6 bytes (8) | C0 | cell voltage extremes, as 21 6B |
+| `3B 6D` + 3 bytes (5) | C0 | capacity bar metric, as 21 6D |
+| `3B 70 NN` (3) | C0 | usage-history clear request (21 65 / 21 67 cleared at the next shutdown) |
+| `3B 84` + 16 bytes (18) | F1 | ID string |
+| `3B 90` + 8 bytes (10) | F0 | LB code bytes |
+
+Response `7B <ID>`. 84 and 90 are not advertised in the bitmaps.
+
+---
+
+## 9. Service 0x3E: tester present
+
+| request | response |
+|---|---|
+| `3E 01` (length 2) | `7E` (one byte, no echo) |
+| `3E`, `3E 00`, `3E 02`, `3E 80` | `7F 3E 12` (no suppress-response bit) |
+
+Any answered request, positive or negative, restarts the 5.0 s session timer.
+
+---
+
+## 10. Differences from the AZE0 (4NC0A) firmware
 
 | item | AZE0 4NC0A | ZE1 5SH2D |
 |---|---|---|
+| P2 / S3 | about 945 ms / 5.1 s | about 900 ms / 5.0 s |
+| ISO-TP buffers | requests up to 156 bytes, responses up to 650 | requests up to 630 bytes, responses up to 690 |
+| new service | | 0x22 (DIDs DA00, DA10–DA14): DTC event log of this and other ECUs with 3.6 s traces |
+| 14 | | also clears the 22 event log |
+| 19 status | mask 0x4E (bits 1, 2, 3, 6) | mask 0x0E (bits 1, 2, 3) |
+| 19 02 | up to 149 DTCs | up to 171 DTCs |
+| DTC list | 206 codes | 175 codes with a failure-type byte; 7 U-codes (AZE0: U1000 U100C U100D) |
+| 19 04 freeze frame | 146 records (592 bytes) | 166 records (688 bytes); adds second current channel, ADC test channels, external-monitor echo, cell-monitor status and fault-context records; drops the OV-limit records |
+| 30 FA bleed test | 24 groups × 4 cells, `30 FA 00 GG MM` | 8 groups × 12 cells, `30 FA 00 GG MH ML`, GG 00 = all groups; odd / even cells alternate |
+| 30 FB / 30 10 | battery heater override | same requests and status codes, but they drive no output; 30 10 low-cell limit is energy / OCV based instead of 3306 mV |
+| 31 | 02, 03, 04, FA | 02 and FA only |
+| 3B | 61–66, 70, 84, 90, 92 | 61–65, 67, 69, 6B, 6D, 70, 84, 90 |
 | current sensors | one | two (wide and fine range), blended; 21 01, 21 03, 21 05 and 21 07 carry both channels |
 | 21 01 | 41 bytes, resistance u16 mΩ | 53 bytes, resistance u32 mΩ × 1024, channel 2 data appended |
 | 21 06 | one bleed status byte per 4-cell group | 96-bit per-cell bleed bitmap |
@@ -578,7 +935,7 @@ The 8-item families most likely correspond to the 8 cell-monitor groups (inferre
 | 21 61 | 12 bytes (Hx, SOH stages) | 331 bytes: whole SOH / aging state incl. OCV curve and capacity-test samples |
 | 21 62 | two charge counters | third counter (low-current quick charges) at the front |
 | 21 65 | 166 bytes | 380 bytes, max and min temperature histograms, session-type means |
-| new IDs | | 11, 12, 67, 69, 6B, 6D |
-| removed IDs | | 66, 92, 94 |
+| new 21 IDs | | 11, 12, 67, 69, 6B, 6D |
+| removed 21 IDs | | 66, 92, 94 |
 | 21 82 | 6 records, other bytes 0 | 9 records, other bytes FF |
 | 21 83 / F0 | "4NC0A" … | "5SH2DV" … |
