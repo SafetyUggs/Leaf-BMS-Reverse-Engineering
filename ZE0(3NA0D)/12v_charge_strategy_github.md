@@ -105,6 +105,31 @@ implements it with different numbers:
 | Top-up length | 5 min | **until the charge current tapers, or 4.1 min**, whichever comes first |
 | Not within ~1 h of power ON/OFF | yes | a pending top-up is never closer than **60 min** |
 
+### In short: car off and parked
+
+The DC/DC converter runs from the traction battery, so **charging the 12V while parked always means
+switching the high-voltage system on**. There is no low-power way to charge it. A parked top-up goes like this:
+
+1. **The clock wakes the VCM** 24 h after the car was last used for 4.1 minutes or more (§3.1).
+2. **No voltage is checked.** The VCM doesn't read the 12V or the traction voltage to decide
+   whether to charge. It tops up every time, as long as:
+   - traction battery SOC is 15 % or more
+   - no 12V/DC-DC fault is stored
+   - the power switch is off
+   - no other wake reason (charging, climate) is active
+3. **High voltage comes on** through the normal precharge and main-relay sequence (§3.3), and the
+   third charge LED blinks.
+4. **It charges at absorption voltage** (the temperature table, ≈14.3 V at 25 °C). There's no
+   float stage and no amp-hour counting.
+5. **It stops** when the charge current falls below a set level, or after **4.1 minutes**, whichever
+   comes first (§3.5).
+6. **High voltage goes off**, the alarm is set for **another 24 h**, and the VCM sleeps.
+
+**The only voltage-triggered charge happens at power-on.** With the power switch ON but not READY,
+if the 12V reading is **10.48 V or lower for 5 seconds**, the VCM starts the same top-up (§3.2).
+While parked and off, a low 12V is **not** detected. Nothing wakes the car because the 12V is low;
+only the clock does.
+
 ### 3.1 It's a clock, not a voltage, that wakes the car
 
 **No 12V voltage level wakes the car.** While asleep the VCM does nothing. Before sleeping, it sets
@@ -252,6 +277,11 @@ The VCM's temperature sensor isn't on the battery.
 ## 6. Not yet known
 
 - the scale (amps per count) of the 12V current sensor
+- **the power-switch signal:** the flag that separates the power-on check from the parked top-up is taken
+  to be "power switch ON" from how the software uses it (READY and diagnostics require it too). Its
+  input wasn't traced.
+- **the 12V reading:** which input feeds the 12V reading used by the charge logic and the 10.48 V check
+  (it's separate from the VCM's own supply-voltage reading)
 - which relay output switches at each start-up step
 - one of the three sources that can request auxiliary HV mode
 - how the alarm is written to the clock chip, and which pin wakes the VCM
